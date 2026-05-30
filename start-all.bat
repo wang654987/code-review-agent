@@ -14,7 +14,7 @@ curl -s http://127.0.0.1:8000/health >nul 2>&1
 if errorlevel 1 goto wait
 
 echo [2/2] Starting ngrok...
-start "ngrok" ngrok http 8000
+start "ngrok" "C:\Program Files\ngrok\ngrok.exe" http 8000
 
 echo.
 echo ==============================
