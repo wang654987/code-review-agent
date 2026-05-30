@@ -19,7 +19,7 @@ from app.github_client import (
     post_review_comments,
 )
 from app.models import HealthResponse, ReviewComment, WebhookPayload
-from app.reviewer import review_pr
+from app.reviewer import pipeline_review
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -116,8 +116,8 @@ async def github_webhook(
         "Parsed %d changed files (%d total hunks)", len(files), sum(len(f.hunks) for f in files)
     )
 
-    # --- 6. Run review ---
-    result = await review_pr(files, pr_url=pr_url)
+    # --- 6. Run pipeline review ---
+    result = await pipeline_review(files, pr_url=pr_url, repo_path=".")
 
     # --- 7. Post comments ---
     try:
@@ -189,12 +189,20 @@ def _build_comment_payload(comments: list[ReviewComment]) -> list[dict]:
 
 
 def _build_summary_body(result) -> str:
-    """Build the review summary text."""
+    """Build the review summary text with confidence markers."""
     if not result.comments:
-        return f"🤖 **AI Code Review**\n\n{result.summary}"
+        return f"\U0001f916 **AI Code Review (Pipeline v2)**\n\n{result.summary}"
 
-    parts = [f"🤖 **AI Code Review**\n\n{result.summary}\n"]
+    parts = [f"\U0001f916 **AI Code Review (Pipeline v2)**\n\n{result.summary}\n"]
     if result.stats:
         stats_line = " | ".join(f"{k}: {v}" for k, v in result.stats.items())
-        parts.append(f"\n📊 **统计**: {stats_line}")
+        parts.append(f"\n\U0001f4ca **统计**: {stats_line}")
+
+    # Add confidence distribution
+    high = sum(1 for c in result.comments if getattr(c, 'confidence', None) == 'high')
+    medium = sum(1 for c in result.comments if getattr(c, 'confidence', None) == 'medium')
+    if high > 0:
+        parts.append(f"\n\U0001f7e2 双模型交叉验证确认: {high} 条")
+    if medium > 0:
+        parts.append(f"\n\U0001f7e1 单模型提出: {medium} 条")
     return "\n".join(parts)

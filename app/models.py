@@ -17,6 +17,21 @@ class ReviewSeverity(str, Enum):
     PRAISE = "praise"  # 写得好的地方
 
 
+class ReviewConfidence(str, Enum):
+    """意见置信度 — 双模型交叉验证后确定。"""
+
+    HIGH = "high"  # 两个模型独立提出一致意见
+    MEDIUM = "medium"  # 只有一个模型提出
+    LOW = "low"  # 静态分析工具（非 LLM）产生
+
+
+class ReviewSource(str, Enum):
+    """审查意见的来源。"""
+
+    LLM = "llm"
+    SEMGREP = "semgrep"
+
+
 class ReviewComment(BaseModel):
     """单条审查意见。"""
 
@@ -28,6 +43,8 @@ class ReviewComment(BaseModel):
     title: str  # 简短标题
     body: str  # 详细说明
     suggestion: str | None = None  # 建议的修改方案（代码）
+    confidence: ReviewConfidence = ReviewConfidence.MEDIUM
+    source: ReviewSource = ReviewSource.LLM
 
 
 class ReviewResult(BaseModel):
@@ -37,6 +54,7 @@ class ReviewResult(BaseModel):
     summary: str  # 审查总结
     comments: list[ReviewComment]
     stats: dict[str, int]  # {"blocker": 0, "warning": 2, "suggestion": 5, "praise": 1}
+    pipeline_info: dict[str, Any] = Field(default_factory=dict)
 
 
 class WebhookPayload(BaseModel):
