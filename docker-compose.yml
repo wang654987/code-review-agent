@@ -1,0 +1,12 @@
+services:
+  agent:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    restart: unless-stopped
+    # For local dev with hot-reload, use:
+    # command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    # volumes:
+    #   - .:/app
