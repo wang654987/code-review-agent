@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import logging
-import re
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -41,6 +41,9 @@ app = FastAPI(
     description="AI-powered multi-stage code review agent",
 )
 
+# Background task registry — prevents garbage collection
+_bg_tasks: set[asyncio.Task] = set()
+
 
 # ---------------------------------------------------------------------------
 # Routes
@@ -61,10 +64,8 @@ async def github_webhook(
 ):
     """Receive GitHub webhook events for pull requests.
 
-    When a PR is opened or synchronized (new commits pushed), the agent
-    runs a full code review and posts comments back to the PR.
-
-    Supported events: ``pull_request`` with action ``opened`` or ``synchronize``.
+    Returns 202 immediately — review runs in background to avoid
+    GitHub's 10-second webhook timeout.
     """
     # --- 1. Verify webhook signature ---
     raw_body = await request.body()
@@ -78,7 +79,8 @@ async def github_webhook(
             {"message": f"Ignored event: {x_github_event}"}, status_code=200
         )
 
-    payload = WebhookPayload(**await request.json())
+    payload_data = await request.json()
+    payload = WebhookPayload(**payload_data)
     if payload.action not in ("opened", "synchronize"):
         return JSONResponse(
             {"message": f"Ignored PR action: {payload.action}"}, status_code=200
@@ -88,62 +90,73 @@ async def github_webhook(
     if not pr:
         raise HTTPException(status_code=400, detail="Missing pull_request data")
 
-    # --- 3. Extract PR coordinates ---
+    # --- 3. Fire background review, respond immediately ---
+    task = asyncio.create_task(_run_review_background(pr, payload_data))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
     pr_number = pr["number"]
-    # pr["base"]["repo"]["full_name"] → "owner/repo"
-    owner, repo = pr["base"]["repo"]["full_name"].split("/", 1)
-    pr_url = pr.get("html_url", "")
-
-    logger.info("Reviewing PR #%d in %s/%s", pr_number, owner, repo)
-
-    # --- 4. Fetch diff ---
-    try:
-        diff_text = await get_pr_diff_via_api(owner, repo, pr_number)
-    except Exception as exc:
-        logger.exception("Failed to fetch diff for PR #%d", pr_number)
-        raise HTTPException(
-            status_code=502, detail=f"Failed to fetch PR diff: {exc}"
-        ) from exc
-
-    if not diff_text.strip():
-        return JSONResponse(
-            {"message": "Empty diff — nothing to review"}, status_code=200
-        )
-
-    # --- 5. Parse diff ---
-    files = parse_diff(diff_text)
-    logger.info(
-        "Parsed %d changed files (%d total hunks)", len(files), sum(len(f.hunks) for f in files)
-    )
-
-    # --- 6. Run pipeline review ---
-    result = await pipeline_review(files, pr_url=pr_url, repo_path=".")
-
-    # --- 7. Post comments ---
-    try:
-        pr_details = await get_pr_details(owner, repo, pr_number)
-        commit_id = pr_details["head"]["sha"]
-    except Exception:
-        logger.exception("Failed to fetch PR details, trying base sha")
-        commit_id = pr["head"]["sha"]
-
-    comments_payload = _build_comment_payload(result.comments)
-    summary_text = _build_summary_body(result)
-    await post_review_comments(
-        owner, repo, pr_number, commit_id,
-        comments=comments_payload,
-        summary=summary_text,
-    )
+    logger.info("Review task created for PR #%d — running in background", pr_number)
 
     return JSONResponse(
         {
-            "message": "Review complete",
-            "pr_url": pr_url,
-            "stats": result.stats,
-            "comment_count": len(result.comments),
+            "message": "Review started in background",
+            "pr_number": pr_number,
         },
-        status_code=200,
+        status_code=202,
     )
+
+
+# ---------------------------------------------------------------------------
+# Background review logic
+# ---------------------------------------------------------------------------
+
+
+async def _run_review_background(pr: dict, raw_payload: dict):
+    """Execute the full review pipeline in background."""
+    try:
+        pr_number = pr["number"]
+        owner, repo = pr["base"]["repo"]["full_name"].split("/", 1)
+        pr_url = pr.get("html_url", "")
+
+        logger.info("[BG] Reviewing PR #%d in %s/%s", pr_number, owner, repo)
+
+        # Fetch diff
+        diff_text = await get_pr_diff_via_api(owner, repo, pr_number)
+        if not diff_text.strip():
+            logger.info("[BG] PR #%d: empty diff — nothing to review", pr_number)
+            return
+
+        # Parse diff
+        files = parse_diff(diff_text)
+        logger.info(
+            "[BG] PR #%d: %d changed files, %d hunks",
+            pr_number, len(files), sum(len(f.hunks) for f in files),
+        )
+
+        # Run pipeline
+        result = await pipeline_review(files, pr_url=pr_url, repo_path=".")
+        logger.info("[BG] PR #%d: review complete — %d comments", pr_number, len(result.comments))
+
+        # Post comments
+        try:
+            pr_details = await get_pr_details(owner, repo, pr_number)
+            commit_id = pr_details["head"]["sha"]
+        except Exception:
+            logger.exception("[BG] PR #%d: failed to get details, using payload sha", pr_number)
+            commit_id = pr["head"]["sha"]
+
+        comments_payload = _build_comment_payload(result.comments)
+        summary_text = _build_summary_body(result)
+        await post_review_comments(
+            owner, repo, pr_number, commit_id,
+            comments=comments_payload,
+            summary=summary_text,
+        )
+        logger.info("[BG] PR #%d: comments posted", pr_number)
+
+    except Exception:
+        logger.exception("[BG] PR review failed")
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +183,7 @@ def _build_comment_payload(comments: list[ReviewComment]) -> list[dict]:
     for c in comments:
         if not c.file_path or c.line_start is None:
             continue
-        emoji = {"blocker": "🔴", "warning": "🟡", "suggestion": "💡", "praise": "✅"}
+        emoji = {"blocker": "\U0001f534", "warning": "\U0001f7e1", "suggestion": "\U0001f4a1", "praise": "\u2705"}
         prefix = emoji.get(c.severity.value if c.severity else "", "")
         body_parts = [f"{prefix} **{c.title}**"]
         if c.category:
@@ -191,14 +204,13 @@ def _build_comment_payload(comments: list[ReviewComment]) -> list[dict]:
 def _build_summary_body(result) -> str:
     """Build the review summary text with confidence markers."""
     if not result.comments:
-        return f"\U0001f916 **AI Code Review (Pipeline v2)**\n\n{result.summary}"
+        return f"\U0001f916 **AI Code Review**\n\n{result.summary}"
 
-    parts = [f"\U0001f916 **AI Code Review (Pipeline v2)**\n\n{result.summary}\n"]
+    parts = [f"\U0001f916 **AI Code Review**\n\n{result.summary}\n"]
     if result.stats:
         stats_line = " | ".join(f"{k}: {v}" for k, v in result.stats.items())
         parts.append(f"\n\U0001f4ca **统计**: {stats_line}")
 
-    # Add confidence distribution
     high = sum(1 for c in result.comments if getattr(c, 'confidence', None) == 'high')
     medium = sum(1 for c in result.comments if getattr(c, 'confidence', None) == 'medium')
     if high > 0:
