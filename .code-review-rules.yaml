@@ -1,0 +1,59 @@
+# Code Review Rules — 团队自定义审查规则
+# 将此文件放在仓库根目录，Code Review Agent 会自动加载
+# 所有规则按 severity 从 blocker → warning → suggestion 逐级检查
+
+rules:
+  # --- 安全规则 ---
+  - name: "禁止硬编码密钥"
+    type: forbid_pattern
+    severity: blocker
+    pattern: '(?i)(api_key|secret|password|token)\s*[:=]\s*["''][\w-]{8,}'
+    message: "检测到可能的硬编码密钥，请使用环境变量或密钥管理服务。"
+    files: ["*.py", "*.ts", "*.js", "*.go", "*.yaml", "*.yml"]
+
+  - name: "禁用 os.system / subprocess shell=True"
+    type: forbid_pattern
+    severity: blocker
+    pattern: '(os\.system\s*\(|subprocess\.\w+\s*\(.*shell\s*=\s*True)'
+    message: "请使用 subprocess.run() 并避免 shell=True，防止命令注入。"
+    files: ["*.py"]
+
+  # --- 代码质量 ---
+  - name: "函数长度限制"
+    type: max_function_lines
+    severity: warning
+    max_lines: 80
+    message: "函数过长，建议拆分以提高可读性和可测试性。"
+    files: ["*.py", "*.ts"]
+
+  - name: "禁用 print 调试"
+    type: forbid_pattern
+    severity: suggestion
+    pattern: '^\s*print\s*\('
+    message: "请使用 logging 模块代替 print。"
+    files: ["*.py"]
+
+  # --- 命名规范 ---
+  - name: "Python 函数名使用 snake_case"
+    type: naming_convention
+    severity: suggestion
+    kind: function
+    pattern: '^[a-z][a-z0-9_]*$'
+    message: "函数名应使用 snake_case 风格。"
+    files: ["*.py"]
+
+  # --- 依赖管理 ---
+  - name: "限制新增依赖数量"
+    type: max_new_deps
+    severity: warning
+    max_count: 3
+    message: "单个 PR 新增依赖过多，请检查是否必要。"
+    files: ["*.py", "*.ts", "*.go"]
+
+  # --- 必需模式 ---
+  - name: "Python 文件必须有类型注解导入"
+    type: require_pattern
+    severity: suggestion
+    pattern: 'from __future__ import annotations'
+    message: "建议在文件头添加 `from __future__ import annotations`。"
+    files: ["*.py"]

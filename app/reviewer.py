@@ -1,8 +1,9 @@
 """Pipeline-based code review — multi-stage with dual-model cross-validation.
 
-Stage 1: Semgrep static analysis (optional)
-Stage 2: Context Builder — AST-based call-chain analysis (optional)
-Stage 3: Dual-model semantic review with cross-validation (optional)
+Stage 1: Semgrep static analysis
+Stage 1.5: Team Rules DSL engine
+Stage 2: Context Builder — AST-based call-chain analysis
+Stage 3: Dual-model semantic review with cross-validation
 Stage 4: Aggregation & deduplication
 """
 
@@ -11,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections import defaultdict
 from typing import Any
 
 import litellm
@@ -25,6 +27,7 @@ from app.models import (
     ReviewSeverity,
     ReviewSource,
 )
+from app.rules_engine import check_rules, load_rules
 from app.semgrep_runner import run_semgrep
 
 logger = logging.getLogger(__name__)
@@ -129,6 +132,21 @@ async def pipeline_review(
             logger.exception("Semgrep stage failed")
             pipeline_info["stages"]["semgrep"] = {"status": "error"}
 
+    # --- Stage 1.5: Team Rules DSL ---
+    rules_comments: list[ReviewComment] = []
+    if settings.enable_semgrep:  # reuse semgrep toggle for now
+        try:
+            rules_config = load_rules(repo_path)
+            rules_comments = check_rules(files, rules_config, repo_path)
+            pipeline_info["stages"]["rules_engine"] = {
+                "status": "ok",
+                "findings": len(rules_comments),
+                "rules_loaded": len(rules_config.rules),
+            }
+        except Exception:
+            logger.exception("Rules engine stage failed")
+            pipeline_info["stages"]["rules_engine"] = {"status": "error"}
+
     # --- Stage 2: Context building ---
     context = ContextGraph()
     if settings.enable_context_builder:
@@ -172,7 +190,7 @@ async def pipeline_review(
             pipeline_info["stages"]["single_model"] = {"status": "error"}
 
     # --- Stage 4: Aggregation ---
-    all_comments = _deduplicate(semgrep_comments + llm_comments)
+    all_comments = _deduplicate(semgrep_comments + rules_comments + llm_comments)
     stats = _compute_stats(all_comments)
     summary = _build_pipeline_summary(all_comments, pipeline_info)
 
@@ -474,13 +492,20 @@ def _compute_stats(comments: list[ReviewComment]) -> dict[str, int]:
 def _build_pipeline_summary(
     comments: list[ReviewComment], pipeline_info: dict,
 ) -> str:
-    """Build a human-readable pipeline summary."""
+    """Build a human-readable pipeline summary with feedback stats."""
+    from app.feedback import format_feedback_summary, get_stats
+
     if not comments:
         stages_ok = sum(
             1 for s in pipeline_info.get("stages", {}).values()
             if isinstance(s, dict) and s.get("status") == "ok"
         )
-        return f"审查完成：未发现问题（{stages_ok} 个分析阶段通过）。"
+        base = f"审查完成：未发现问题（{stages_ok} 个分析阶段通过）。"
+        try:
+            fb = format_feedback_summary(get_stats())
+        except Exception:
+            fb = ""
+        return base + fb
 
     high = sum(1 for c in comments if c.confidence == ReviewConfidence.HIGH)
     medium = sum(1 for c in comments if c.confidence == ReviewConfidence.MEDIUM)
@@ -490,4 +515,13 @@ def _build_pipeline_summary(
     if high:
         parts.append(f"（其中 {high} 个经双模型交叉验证确认）")
     parts.append(f"。置信度分布：高={high} / 中={medium} / 低={low}。")
-    return "".join(parts)
+
+    # Add feedback stats
+    try:
+        fb = format_feedback_summary(get_stats())
+        if fb:
+            parts.append(fb)
+    except Exception:
+        pass
+
+    return "\n".join(parts)

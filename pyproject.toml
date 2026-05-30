@@ -1,7 +1,7 @@
 [project]
 name = "code-review-agent"
-version = "0.2.0"
-description = "AI-powered code review agent with multi-stage analysis pipeline and dual-model cross-validation"
+version = "0.3.0"
+description = "AI code review agent — multi-stage pipeline with dual-model cross-validation, team rules DSL, and feedback learning"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115.0",

@@ -8,3 +8,4 @@ venv/
 dist/
 build/
 .review_cache/
+.review_feedback.db
